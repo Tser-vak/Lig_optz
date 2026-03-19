@@ -5,3 +5,4 @@ test_data
 failed_ligands.log
 GEMINI.md
 ligand_pipeline.log
+optimized_ligands/

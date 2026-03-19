@@ -7,28 +7,31 @@ into optimized 3D geometries (PDB).
 Scientific Workflow:
 1.  Molecule Sanitization: Validates chemical structures (valency, aromaticity).
 2.  Hydrogen Addition: Essential for accurate force field energy calculations.
-3.  3D Embedding: Uses ETKDG (Experimental-Torsion Knowledge Distance Geometry) 
-    to generate realistic initial 3D conformations.
-4.  Force Field Optimization: Minimizes the molecule's energy using MMFF94 
-    (Merck Molecular Force Field) or UFF (Universal Force Field) as a fallback.
+3.  3D Embedding: Uses ETKDG (Experimental-Torsion Knowledge Distance Geometry).
+4.  Force Field Optimization: Minimizes the molecule's energy using MMFF94 or UFF.
 
-Designed for high-throughput screening prep using multiprocessing.
+Designed for high-throughput screening prep using multiprocessing with strict timeouts.
 """
-
 
 import os
 import logging
 import argparse
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import as_completed, TimeoutError
 from typing import Optional
 
 from tqdm import tqdm
 from rdkit import Chem, rdBase 
-from rdkit.Chem import  rdmolfiles, rdDistGeom, rdForceFieldHelpers
+from rdkit.Chem import rdmolfiles, rdDistGeom, rdForceFieldHelpers
 from rdkit.Chem import AllChem
+
+# Import pebble to handle forceful termination of stuck C-extensions
+try:
+    from pebble import ProcessPool
+except ImportError:
+    raise ImportError("Please install pebble to handle timeouts: pip install pebble")
 
 # Silence RDKit warnings to keep the tqdm progress bar clean
 rdBase.DisableLog("rdApp.*")
@@ -40,10 +43,6 @@ rdBase.DisableLog("rdApp.*")
 # ---------------------------------------------------------------------------
 
 def setup_logger(log_file: Path) -> logging.Logger:
-    """
-    Configures a file-only logger for clean console output.
-    - File: Records detailed debug information and errors (DEBUG).
-    """
     logger = logging.getLogger("LigandPipeline")
     logger.setLevel(logging.DEBUG)
 
@@ -181,26 +180,21 @@ class MoleculeProcessor:
         """
         # Stage 1: Modern ETKDG
         params = rdDistGeom.ETKDGv3()
-        for seed in range(self.config.embed_attempts):
-            params.randomSeed = seed
-            if AllChem.EmbedMolecule(mol, params) != -1:
-                return mol
-
-        # Stage 2: Fallback to v2
+        params.maxIterations = self.config.embed_attempts * 10 
+        if AllChem.EmbedMolecule(mol, params) != -1:
+            return mol
+        
+        # Stage 2: Older ETKDG (sometimes more forgiving)
         params_v2 = rdDistGeom.ETKDGv2()
-        for seed in range(self.config.embed_attempts):
-            params_v2.randomSeed = seed
-            if AllChem.EmbedMolecule(mol, params_v2) != -1:
-                return mol
-
-        # Stage 3: Random Coords (Desperation mode)
+        params_v2.maxIterations = self.config.embed_attempts * 10
+        if AllChem.EmbedMolecule(mol, params_v2) != -1:
+            return mol
+        # Stage 3: Random Coordinates (not ideal but better than failure)
         params_rand = rdDistGeom.ETKDGv3()
         params_rand.useRandomCoords = True
-        for seed in range(self.config.embed_attempts):
-            params_rand.randomSeed = seed
-            if AllChem.EmbedMolecule(mol, params_rand) != -1:
-                return mol
-
+        params_rand.maxIterations = self.config.embed_attempts * 10
+        if AllChem.EmbedMolecule(mol, params_rand) != -1:
+            return mol
         raise _PipelineError(f"3D embedding failed for {name} after multiple attempts.")
 
     def _optimize_geometry(self, mol: Chem.Mol, name: str) -> bool:
@@ -264,7 +258,7 @@ class LigandBatchRunner:
             self.logger.warning(f"No SDF files found in {self.config.input_dir}")
             return
 
-        self.logger.info(f"Starting pipeline for {len(sdf_files)} molecules...")
+        self.logger.info(f"Starting pipeline for {len(sdf_files)} molecules using {self.config.num_workers} workers...")
         t_start = time.perf_counter()
 
         # Execute in parallel
@@ -286,18 +280,32 @@ class LigandBatchRunner:
                 results.append(result)
             return results
 
-        # Parallel mode
-        with ProcessPoolExecutor(max_workers=self.config.num_workers) as executor:
-            futures = {executor.submit(_process_one, p, self.config): p for p in sdf_files}
+        # NEW: Parallel mode using Pebble for robust timeout handling
+        with ProcessPool(max_workers=self.config.num_workers) as pool:
+            # Map futures to their specific file paths so we know who failed
+            futures = {}
+            for p in sdf_files:
+                future = pool.schedule(_process_one, args=(p, self.config), timeout=self.config.timeout)
+                futures[future] = p
             
-            # tqdm wrap around as_completed for the parallel progress bar
             with tqdm(total=total, desc="Optimizing Ligands (Parallel)", unit="mol") as pbar:
                 for future in as_completed(futures):
-                    result = future.result()
-                    self._log_result(result)
-                    results.append(result)
-                    pbar.update(1)
-                    
+                    path = futures[future]
+                    try:
+                        result = future.result()
+                        self._log_result(result)
+                        results.append(result)
+                    except TimeoutError:
+                        err_msg = f"Timed out after {self.config.timeout}s (Molecule stuck)"
+                        self._log_failure(path.name, err_msg)
+                        results.append(MoleculeResult(filename=path.name, success=False, error=err_msg))
+                    except Exception as e:
+                        err_msg = f"Worker crash/error: {e}"
+                        self._log_failure(path.name, err_msg)
+                        results.append(MoleculeResult(filename=path.name, success=False, error=err_msg))
+                    finally:
+                        pbar.update(1)
+                        
         return results
 
     def _log_result(self, result: MoleculeResult) -> None:
@@ -305,9 +313,12 @@ class LigandBatchRunner:
         if result.success:
             self.logger.info(f"[OK] {result.filename} | converged={result.converged}")
         else:
-            self.logger.error(f"[FAIL] {result.filename} | {result.error}")
-            with open(self.config.failed_log, "a") as f:
-                f.write(f"{result.filename}: {result.error}\n")
+            self._log_failure(result.filename, str(result.error))
+
+    def _log_failure(self, filename: str, error: str) -> None:
+        self.logger.error(f"[FAIL] {filename} | {error}")
+        with open(self.config.failed_log, "a") as f:
+            f.write(f"{filename}: {error}\n")
 
     def _report(self, results: list[MoleculeResult], total: int, elapsed: float) -> None:
         """Prints a summary of the entire run."""
@@ -330,17 +341,25 @@ def parse_args() -> PipelineConfig:
     parser = argparse.ArgumentParser(
         description="Scientific Ligand Optimizer: 3D generation and force field minimization."
     )
+    
+    # NEW: Calculate default workers (All CPUs - 3, ensuring at least 1)
+    default_workers = max(1, (os.cpu_count() or 4) - 3)
+
     parser.add_argument(
-        "--input", type=Path, default=Path("test_data"),
+        "--input", type=Path, default=Path("ligands"),
         help="Input directory with SDF files"
     )
     parser.add_argument(
-        "--output", type=Path, default=Path("new_output"),
+        "--output", type=Path, default=Path("optimized_ligands"),
         help="Output directory for PDB files"
     )
     parser.add_argument(
-        "--workers", type=int, default=4,
-        help="Parallel worker processes (1 = sequential mode)"
+        "--workers", type=int, default=default_workers,
+        help=f"Parallel worker processes (Default on this machine: {default_workers})"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=60,
+        help="Maximum seconds to spend on a single molecule before giving up (Default: 60)"
     )
     parser.add_argument(
         "--iters", type=int, default=2000,
@@ -375,6 +394,7 @@ def parse_args() -> PipelineConfig:
         log_file       = args.log,
         failed_log     = args.failed,
         num_workers    = args.workers,
+        timeout        = args.timeout,
         embed_attempts = args.attempts,
         ff_max_iters   = args.iters,
         force_field    = args.ff,
