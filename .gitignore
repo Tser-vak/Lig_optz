@@ -1,0 +1,7 @@
+#Ignore_data_files 
+ligands/
+new_output/
+test_data
+failed_ligands.log
+GEMINI.md
+ligand_pipeline.log
