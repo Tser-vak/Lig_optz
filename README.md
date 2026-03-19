@@ -22,3 +22,14 @@ conda activate ligand_prep
 
 # 2. Install the multiprocessing and progress bar libraries
 pip install pebble tqdm
+
+## 🚀 Usage
+
+Place your input `.sdf` files in a folder (default is `./ligands`) and run the script.
+
+### Basic Run
+
+Will process all SDFs in the `ligands/` folder and output optimized PDBs to `optimized_ligands/`.
+
+```bash
+python Optimizing_ligands.py
