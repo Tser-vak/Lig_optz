@@ -1,4 +1,4 @@
-# Ligand 3D Generation & Force Field Optimization... 🧪Needs some fixies🧪
+# Ligand 3D Generation & Force Field Optimization ... 🧪Needs some fixies🧪
 
 A robust, high-throughput Python pipeline for converting 2D/3D ligand structures (SDF) into energy-optimized 3D geometries (PDB). 
 
